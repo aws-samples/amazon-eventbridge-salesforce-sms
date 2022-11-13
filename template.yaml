@@ -1,0 +1,402 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+Description: >
+  Create resources for demonstrating EventBridge to Step Functions integration to publish SMS messages via SNS.
+
+Parameters:
+  SalesforceEventSource:
+    Description: Name of Salesforce Event Source
+    Type: String
+    Default: 'aws.partner/salesforce.com/00D9A000000E9uLUAS/0YL9A0000004CAaWAM'
+
+  SalesforceUsername:
+    Type: String
+    Description: >-
+      Salesforce username that will be stored in AWS Secrets Manager and used
+      by Amazon EventBridge for authentication when sending events.
+    MinLength: 1
+
+  SalesforcePassword:
+    Type: String
+    Description: >-
+      Salesforce password that will be stored in AWS Secrets Manager and used
+      by Amazon EventBridge for authentication when sending events.
+    NoEcho: True
+    MinLength: 8
+
+  SalesforceOAuthClientID:
+    Type: String
+    Description: >-
+      Salesforce provided OAuth client ID that will be stored in
+      AWS Secrets Manager and used by Amazon EventBridge for authentication
+      when sending events.
+    NoEcho: True
+    MinLength: 1
+
+  SalesforceOAuthClientSecret:
+    Type: String
+    Description: >-
+      Salesforce provided OAuth client secret that will be stored in
+      AWS Secrets Manager and used by Amazon EventBridge for authentication
+      when sending events.
+    NoEcho: True
+    MinLength: 1
+
+  SalesforceAuthorizationEndpoint:
+    Type: String
+    Description: >-
+      Salesforce OAuth authorization endpoint URL. Example:
+      'https://<InstanceName>.my.salesforce.com/services/oauth2/token'.
+
+  SalesforcePlatformEventEndpoint:
+    Type: String
+    Description: >-
+      Salesforce platform event endpoint URL. Example:
+      'https://<InstanceName>.my.salesforce.com/services/data/v55.0/sobjects/ServiceProviderEvent'.
+
+  SalesforcePlatformEventEndpointRateLimit:
+    Type: Number
+    Description: >-
+      Rate limit for Amazon EventBridge to the Salesforce platform event
+      endpoint. The default soft limit is 25 for Production organizations &
+      Sandboxes, and the default soft limit is 5 for Developer Edition & Trial
+      organizations. Reference:
+      'https://developer.salesforce.com/docs/atlas.en-us.salesforce_app_limits_cheatsheet.meta/salesforce_app_limits_cheatsheet/salesforce_app_limits_platform_api.htm'.
+    MinValue: 1
+    Default: 25
+
+  MaximumRetryAttempts:
+    Type: Number
+    Description: >-
+      The maximum number of retry attempts to make before the request fails.
+      Retry attempts continue until either the maximum number of attempts is
+      made or until the duration of the MaximumEventAgeInSeconds is met.
+    MinValue: 0
+    MaxValue: 185
+    Default: 4
+
+  MaximumEventAgeInSeconds:
+    Type: Number
+    Description: >-
+      The maximum amount of time, in seconds, to continue to make retry
+      attempts.
+    MinValue: 60 # 1 minute
+    MaxValue: 86400 # 1 day
+    Default: 400 # 6.7 minutes
+
+Resources:
+  SalesforceSNSInboundEventBus: 
+    Type: AWS::Events::EventBus
+    Properties: 
+      EventSourceName: !Ref SalesforceEventSource
+      Name: !Ref SalesforceEventSource
+
+  SalesforceSNSOutboundEventBus: 
+    Type: AWS::Events::EventBus
+    Properties: 
+      Name: "SalesforceSNSOutboundEventBus"
+
+  LogGroupForEvents:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: /aws/vendedlogs/events/resource-policy-test
+
+  LogGroupForEventsPolicy:
+    Type: AWS::Logs::ResourcePolicy
+    Properties:
+      PolicyName: EventBridgeToCWLogsPolicy
+      PolicyDocument: !Sub >
+        {
+          "Version": "2012-10-17",
+          "Statement": [
+            {
+              "Sid": "EventBridgetoCWLogsCreateLogStreamPolicy",
+              "Effect": "Allow",
+              "Principal": {
+                "Service": [
+                  "events.amazonaws.com"
+                ]
+              },
+              "Action": [
+                "logs:CreateLogStream"
+              ],
+              "Resource": [
+                "${LogGroupForEvents.Arn}"
+              ]
+            },
+            {
+              "Sid": "EventBridgetoCWLogsPutLogEventsPolicy",
+              "Effect": "Allow",
+              "Principal": {
+                "Service": [
+                  "events.amazonaws.com"
+                ]
+              },
+              "Action": [
+                "logs:PutLogEvents"
+              ],
+              "Resource": [
+                "${LogGroupForEvents.Arn}"
+              ],
+              "Condition": {
+                "ArnEquals": {"AWS:SourceArn": "${EventBridgeOutboundTrigger.Arn}"}
+              }
+            }
+          ]
+        }
+
+  EventBridgeOutboundTrigger:
+    Type: 'AWS::Events::Rule'
+    Properties:
+      Description: Salesforce event trigger
+      EventBusName: SalesforceSNSOutboundEventBus
+      EventPattern:
+        account:
+          - !Ref AWS::AccountId
+      Name: SalesforceEventBridgeOutboundTrigger
+      State: ENABLED
+      Targets:
+        - Arn: !GetAtt LogGroupForEvents.Arn
+          Id: LogTarget
+
+  SNSPublishStateMachine:
+    Type: AWS::Serverless::StateMachine
+    Properties:
+      Tracing:
+        Enabled: true
+      Events:
+        EventBridgeTrigger:
+          Type: EventBridgeRule
+          Properties:
+            EventBusName: !Ref SalesforceEventSource
+            Pattern:
+              account:
+                - !Ref AWS::AccountId
+      Definition:
+        Comment: Send SMS to mobile endpoints
+        StartAt: SendSMS
+        TimeoutSeconds: 900
+        States:
+          SendSMS:
+            Type: Task
+            Resource: arn:aws:states:::aws-sdk:sns:publish
+            InputPath: $.detail.payload
+            Parameters:
+              Message.$: "$.Message__c"
+              PhoneNumber.$: "$.PhoneNumber__c"
+            End: true
+      Policies:
+        - CloudWatchPutMetricPolicy: {}
+        - Version: "2012-10-17"
+          Statement:
+          - Sid: SNSPublish
+            Effect: Allow
+            Action:
+            - SNS:Publish
+            Resource: '*'
+
+
+
+## Outbound event
+
+  SMSResponseProcessLambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Action: ["sts:AssumeRole"]
+            Principal:
+              Service: ["lambda.amazonaws.com"]
+      Path: /
+      Policies:
+        - PolicyName: root
+          PolicyDocument:
+            Version: 2012-10-17
+            Statement:
+              - Effect: Allow
+                Action:
+                  - 'logs:CreateLogGroup'
+                  - 'logs:CreateLogStream'
+                  - 'logs:PutLogEvents'
+                Resource: !Sub 'arn:${AWS::Partition}:logs:*:*:*'
+              - Effect: Allow
+                Action:
+                  - 'events:PutEvents'
+                Resource: !Sub 'arn:${AWS::Partition}:events:${AWS::Region}:${AWS::AccountId}:event-bus/default'
+
+  SMSResponseProcessLambda:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: src/SMSResponseProcessLambda
+      Description: 'This functions does the processing of the SMS response.'
+      MemorySize: 512
+      Role: !GetAtt SMSResponseProcessLambdaRole.Arn
+      Runtime: python3.7
+      Handler: app.lambda_handler
+      Timeout: 900
+
+  SNSLambdaPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !GetAtt SMSResponseProcessLambda.Arn
+      Action: lambda:InvokeFunction
+      Principal: sns.amazonaws.com
+      SourceArn: !Ref SMSResponseSNSTopic
+
+  SNSTopicKey:
+    Type: AWS::KMS::Key
+    Properties:
+      Description: An symmetric CMK for SNS
+      EnableKeyRotation: true
+      KeyPolicy:
+        Version: '2012-10-17'
+        Id: keyForSNS
+        Statement:
+        - Sid: Delegate administration of key to the account principal
+          Effect: Allow
+          Principal:
+            AWS: !Sub 'arn:${AWS::Partition}:iam::${AWS::AccountId}:root'
+          Action: kms:*
+          Resource: '*'
+        - Sid: Enable Pinpoint to decrypt messages
+          Effect: Allow
+          Principal:
+            Service:
+              - sms-voice.amazonaws.com
+              - mobile.amazonaws.com
+              - sns.amazonaws.com
+          Action:
+            - "kms:GenerateDataKey*"
+            - "kms:Decrypt"
+          Resource: '*'
+
+  SMSResponseSNSTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      Subscription:
+        - Endpoint: !GetAtt SMSResponseProcessLambda.Arn
+          Protocol: "lambda"
+      TopicName: "SMSResponseSNSTopic"
+      KmsMasterKeyId: !Ref SNSTopicKey
+
+  SMSResponseSNSTopicPolicy:
+    Type: AWS::SNS::TopicPolicy
+    Properties: 
+      PolicyDocument:
+        Statement:
+          - Sid: AllowServices
+            Effect: Allow
+            Principal:
+              Service:
+                - events.amazonaws.com
+                - cloudwatch.amazonaws.com
+                - sms-voice.amazonaws.com
+                - mobile.amazonaws.com
+            Action: 'sns:Publish'
+            Resource:
+              - !Ref SMSResponseSNSTopic
+          - Sid: AllowAWS
+            Effect: Allow
+            Principal:
+              AWS: !Sub "arn:${AWS::Partition}:iam::${AWS::AccountId}:root"
+            Action: 'sns:Publish'
+            Resource:
+              - !Ref SMSResponseSNSTopic
+      Topics: 
+        - !Ref SMSResponseSNSTopic
+
+  SalesforceApiDestinationRole:
+    Type: AWS::IAM::Role
+    Properties:
+      Description: >-
+        Amazon EventBridge destination role for invoking the Salesforce service
+        provider event API endpoint.
+      RoleName: Salesforce_EventBridge_Invoke_Api_Destination
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - events.amazonaws.com
+            Action:
+              - sts:AssumeRole
+      Path: /service-role/
+      Policies:
+        - PolicyName: SalesforceApiDestinationPolicy
+          PolicyDocument:
+            Version: 2012-10-17
+            Statement:
+              - Effect: Allow
+                Action:
+                  - events:InvokeApiDestination
+                Resource: !GetAtt SalesforceApiDestination.Arn
+
+  SalesforceConnectionSecret:
+    Type: AWS::SecretsManager::Secret
+    Properties:
+      Name: SalesforceOAuthSecret
+      Description: OAuth connection credential secret.
+      SecretString: !Sub >-
+        {
+          "ClientID": "${SalesforceOAuthClientID}",
+          "ClientSecret": "${SalesforceOAuthClientSecret}",
+          "Username": "${SalesforceUsername}",
+          "Password": "${SalesforcePassword}"
+        }
+
+  SalesforceOAuthConnection:
+    Type: AWS::Events::Connection
+    Properties:
+      Name: SalesforceOAuthConnection
+      AuthorizationType: OAUTH_CLIENT_CREDENTIALS
+      AuthParameters:
+        OAuthParameters:
+          AuthorizationEndpoint: !Ref SalesforceAuthorizationEndpoint
+          ClientParameters:
+            ClientID: '{{resolve:secretsmanager:SalesforceOAuthSecret:SecretString:ClientID}}'
+            ClientSecret: '{{resolve:secretsmanager:SalesforceOAuthSecret:SecretString:ClientSecret}}'
+          HttpMethod: POST
+          OAuthHttpParameters:
+            BodyParameters:
+              - IsValueSecret: false
+                Key: grant_type
+                Value: password
+              - IsValueSecret: false
+                Key: username
+                Value: '{{resolve:secretsmanager:SalesforceOAuthSecret:SecretString:Username}}'
+              - IsValueSecret: true
+                Key: password
+                Value: '{{resolve:secretsmanager:SalesforceOAuthSecret:SecretString:Password}}'
+    DependsOn: SalesforceConnectionSecret
+
+  SalesforceApiDestination:
+    Type: AWS::Events::ApiDestination
+    Properties:
+      ConnectionArn: !GetAtt SalesforceOAuthConnection.Arn
+      Description: >-
+        API destination to send events to Salesforce platform event endpoint.
+      HttpMethod: POST
+      InvocationEndpoint: !Ref SalesforcePlatformEventEndpoint
+      InvocationRateLimitPerSecond: !Ref SalesforcePlatformEventEndpointRateLimit
+
+  SalesforceEventRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Description: Rule to use API Destination with Input Transformer
+      State: ENABLED
+      EventPattern:
+        source:
+          - com.salesforce.sms
+      RoleArn: !GetAtt SalesforceApiDestinationRole.Arn
+      Targets:
+        - Id: Salesforce-destination
+          Arn: !GetAtt SalesforceApiDestination.Arn
+          RetryPolicy:
+            MaximumRetryAttempts: !Ref MaximumRetryAttempts
+            MaximumEventAgeInSeconds: !Ref MaximumEventAgeInSeconds
+          RoleArn: !GetAtt SalesforceApiDestinationRole.Arn
+          InputPath: "$.detail"
+
